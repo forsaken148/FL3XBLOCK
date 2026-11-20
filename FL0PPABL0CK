@@ -873,7 +873,7 @@ end
 
 -- auto block
 
-local VisualCheckBeam, HitboxFolder, SetAutoBlock, UpdateDiamondZoneVisibility
+local VisualCheckBeam, HitboxFolder, SetAutoBlock, UpdateDiamondZoneVisibility -- UpdateDiamondZoneVisibility is a no-op stub
 do
 local AttackSounds = IdSet({
     "100600301396617","101199185291628","101553872555606","101698569375359","104910828105172","105204810054381","105207247877248","105516183226360","105840448036441","106836941416453",
@@ -929,24 +929,6 @@ local function DragToward(KillerRoot)
         end
         if LocalHumanoid and State.AutoBlock then LocalHumanoid:Move(Vector3.zero, false) end
     end)
-end
-
--- Returns true if the local character has a Tool whose name contains "cone"
-local function IsEquippedCone()
-    if not LocalCharacter then return false end
-    for _, obj in ipairs(LocalCharacter:GetChildren()) do
-        if obj:IsA("Tool") and obj.Name:lower():find("cone") then
-            return true
-        end
-    end
-    return false
-end
-
--- When a cone item is equipped, only allow blocking if we are inside the
--- killer's cone zone.  When no cone is equipped, always allow (original behaviour).
-local function IsConeBlockAllowed(Killer)
-    if not IsEquippedCone() then return true end
-    return DZ_IsInZone(Killer)
 end
 
 -- Standalone block-cooldown check used by both original and alt auto block.
@@ -1005,16 +987,35 @@ local function GetLocalQueryHitbox()
     return LocalCharacter:FindFirstChild("QueryHitbox")
 end
 
+-- Returns true if the local player is inside the killer's facing vision cone.
+-- Only called when VC.enabled is true; when the visual is off, blocking is unrestricted.
+local function VC_IsPlayerInCone(Killer)
+    if not VC.enabled then return true end
+    local killerHRP = Killer and Killer:FindFirstChild("HumanoidRootPart")
+    if not killerHRP or not LocalRoot then return false end
+    local origin   = killerHRP.Position
+    local myPos    = LocalRoot.Position
+    local lv       = killerHRP.CFrame.LookVector
+    local flat     = Vector3.new(lv.X, 0, lv.Z)
+    if flat.Magnitude < 0.01 then return false end
+    flat = flat.Unit
+    local toMe     = Vector3.new(myPos.X - origin.X, 0, myPos.Z - origin.Z)
+    local dist     = toMe.Magnitude
+    if dist > VC.range or dist < 0.01 then return false end
+    local halfAng  = math.rad(VC.angle / 2)
+    return toMe.Unit:Dot(flat) >= math.cos(halfAng)
+end
+
 local function TriggerBlockWithHitbox(Killer, QueryHitbox)
     if not State.AutoBlock or not LocalRoot then return end
-    -- Cone gate: if the player has a cone equipped, only block when inside the cone zone
-    if not IsConeBlockAllowed(Killer) then return end
+    -- Vision cone gate: if the visual check is on, only block when inside the killer's facing cone
+    if not VC_IsPlayerInCone(Killer) then return end
     local LocalQuery = GetLocalQueryHitbox(); if not LocalQuery then return end
     local Params = OverlapParams.new(); Params.MaxParts = 1; Params.BruteForceAllSlow = true; Params.IncludeInstances = { LocalQuery }
     for i = 1, 10 do
         if not State.AutoBlock or not QueryHitbox.Parent then break end
-        -- Re-check cone gate each iteration in case the player moved out of the zone
-        if not IsConeBlockAllowed(Killer) then break end
+        -- Re-check each loop in case the player stepped out of the cone mid-swing
+        if not VC_IsPlayerInCone(Killer) then break end
         local boxCFrame = QueryHitbox.CFrame * CustomHitboxOffset; local boxSize = CustomHitboxSize * 2.2
         local Hit = workspace:GetPartBoundsInBox(boxCFrame, boxSize, Params)
         if #Hit > 0 then DoBlock(QueryHitbox); break end
@@ -1031,9 +1032,8 @@ local function WatchKiller(Killer)
     local Connections = {}; local Hooked = {}
     local function Trigger()
         if QueryHitbox and State.AutoBlock then
-            -- IsConeBlockAllowed is checked again inside TriggerBlockWithHitbox,
-            -- but do a quick pre-check here to avoid spawning a thread at all.
-            if IsConeBlockAllowed(Killer) then
+            -- Quick pre-check to avoid spawning a thread when already outside the cone
+            if VC_IsPlayerInCone(Killer) then
                 task.spawn(TriggerBlockWithHitbox, Killer, QueryHitbox)
             end
         end
@@ -1160,327 +1160,7 @@ table.insert(CharacterCallbacks, function()
     end)
 end)
 
--- ============================================================
--- DIAMOND ZONE AUTO BLOCK ENGINE
--- ============================================================
-local DZ = { running=false, connections={}, folder=nil, killerZones={} }
-local DZ_PLAYER_R = 1.5
-local DZ_ZONE_OFF = 0.15
-local DZ_DIA_H    = 3
-local DZ_CIR_H    = 1
-
-local function DZ_GetColor()      return Color3.fromRGB(255, 60, 60) end
-local function DZ_GetReadyColor() return Color3.fromRGB(80, 255, 80) end
-
-local function DZ_IsPlayerKiller()
-    if not KillersFolder or not LocalPlayer then return false end
-    return KillersFolder:FindFirstChild(LocalPlayer.Name) ~= nil
-end
-
-local function DZ_ComputeFootOff(k, kr)
-    local names = {"LeftFoot","RightFoot","Left Leg","Right Leg","LeftLowerLeg","RightLowerLeg"}
-    local low = nil
-    for _, n in ipairs(names) do
-        local p = k:FindFirstChild(n)
-        if p and p:IsA("BasePart") then
-            local b = p.Position.Y - p.Size.Y / 2
-            if not low or b < low then low = b end
-        end
-    end
-    return (low and (low - kr.Position.Y)) or -3
-end
-
-local function DZ_GetBaseY(kr, z) return kr.Position.Y + (z.footOffsetY or -3) + DZ_ZONE_OFF end
-
-local function DZ_GetFlatLook(kr, y)
-    -- In Roblox, HumanoidRootPart.CFrame.LookVector points backward (-Z).
-    -- Negate it so the cone faces the killer's visual front.
-    local lv = -kr.CFrame.LookVector
-    local f  = Vector3.new(lv.X, 0, lv.Z)
-    if f.Magnitude < 0.01 then f = Vector3.new(0, 0, 1) else f = f.Unit end
-    local p  = Vector3.new(kr.Position.X, y, kr.Position.Z)
-    return CFrame.lookAt(p, p + f)
-end
-
-local function DZ_IsInCone(myPos, kCF, kPos)
-    -- Negate LookVector: in Roblox HRP.CFrame.LookVector points backward,
-    -- so -LookVector is the killer's actual visual front direction.
-    local fwd = -kCF.LookVector
-    local ff  = Vector3.new(fwd.X, 0, fwd.Z)
-    if ff.Magnitude < 0.01 then return false end
-    ff = ff.Unit
-    local range   = State.DZ_DiamondLength or 8   -- max reach of cone
-    local halfAng = math.rad((State.DZ_DiamondWidth or 45) / 2) -- half angle in radians
-    local off     = State.DZ_DiamondOffset or 3   -- dead zone behind killer tip
-    local dY = math.abs(myPos.Y - kPos.Y)
-    if dY > 10 + DZ_PLAYER_R then return false end
-    local tp  = Vector3.new(myPos.X - kPos.X, 0, myPos.Z - kPos.Z)
-    local dist = tp.Magnitude
-    -- must be beyond offset and within range (+player radius)
-    if dist < off or dist > range + DZ_PLAYER_R then return false end
-    if dist < 0.01 then return true end
-    local dot = tp.Unit:Dot(ff)
-    -- dot >= cos(halfAng) means inside the cone angle
-    return dot >= math.cos(halfAng + DZ_PLAYER_R / math.max(dist, 1))
-end
-
-local function DZ_IsInCircle(myPos, kPos)
-    local dx = myPos.X - kPos.X; local dz = myPos.Z - kPos.Z
-    local r  = (State.DZ_CircleRadius or 5) + DZ_PLAYER_R
-    local dY = math.abs(myPos.Y - kPos.Y)
-    if dY > 10 + DZ_PLAYER_R then return false end
-    return dx * dx + dz * dz <= r * r
-end
-
-local function DZ_IsInZone(k)
-    if not k or not k.Parent then return false end
-    local kr = k:FindFirstChild("HumanoidRootPart")
-    local c  = LocalPlayer.Character
-    local mr = c and c:FindFirstChild("HumanoidRootPart")
-    if not kr or not mr then return false end
-    -- Only fire block inside the cone range. Circle is visual only.
-    return DZ_IsInCone(mr.Position, kr.CFrame, kr.Position)
-end
-
-local DZ_ARC_SEGS = 8  -- number of arc segments along the cone's curved edge
-
-local function DZ_BuildZone(k)
-    local m  = Instance.new("Model"); m.Name = "FlexConeZone_" .. k.Name; m.Parent = DZ.folder
-    local kr = k:FindFirstChild("HumanoidRootPart")
-    local fo = (kr and DZ_ComputeFootOff(k, kr)) or -3
-    local edges = {}
-    -- 2 side rays + DZ_ARC_SEGS arc segments = 2 + DZ_ARC_SEGS parts
-    local totalParts = 2 + DZ_ARC_SEGS
-    for i = 1, totalParts do
-        local p = Instance.new("Part"); p.Name = "ConeEdge" .. i
-        p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false; p.CastShadow = false
-        p.Material = Enum.Material.Neon; p.Color = DZ_GetColor()
-        p.Transparency = 0.6; p.Size = Vector3.new(0.3, 0.08, 1)
-        p.CFrame = CFrame.new(0, -5000, 0); p.Parent = m; edges[i] = p
-    end
-    local c = Instance.new("Part"); c.Shape = Enum.PartType.Cylinder; c.Name = "Circle"
-    c.Anchored = true; c.CanCollide = false; c.CanQuery = false; c.CanTouch = false; c.CastShadow = false
-    c.Material = Enum.Material.Neon; c.Color = DZ_GetColor()
-    c.Transparency = 0.7; c.Size = Vector3.new(DZ_CIR_H, 10, 10)
-    c.CFrame = CFrame.new(0, -5000, 0); c.Parent = m
-    return { model = m, edges = edges, circle = c, killer = k, footOffsetY = fo }
-end
-
-local function DZ_UpdateZone(z, kr, mr)
-    if not z or not z.model or not z.model.Parent or not kr or not kr.Parent then return end
-    if DZ_IsPlayerKiller() then
-        for _, e in ipairs(z.edges) do if e and e.Parent then e.Transparency = 1 end end
-        if z.circle and z.circle.Parent then z.circle.Transparency = 1 end
-        return
-    end
-
-    local range   = State.DZ_DiamondLength or 8
-    local halfAng = math.rad((State.DZ_DiamondWidth or 45) / 2)
-    local off     = State.DZ_DiamondOffset or 3
-
-    local eitherZoneOn = State.DiamondZoneAB or (G1337 and G1337.settings and G1337.settings.g1337DiamondZone)
-    local showCone   = State.DZ_ShowDiamond and eitherZoneOn
-    local showCircle = State.DZ_ShowCircle  and eitherZoneOn
-
-    local bY  = DZ_GetBaseY(kr, z)
-    local cCF = DZ_GetFlatLook(kr, bY + DZ_CIR_H)
-    local coneCF = DZ_GetFlatLook(kr, bY + DZ_DIA_H)
-
-    -- Cone tip is at the offset point in front of the killer
-    -- Side rays go from the tip to the two far edge points
-    -- Arc segments connect equally-spaced points along the curved end
-
-    local fwd = coneCF.LookVector  -- already flat unit from DZ_GetFlatLook
-    local kFlat = Vector3.new(kr.Position.X, bY + DZ_DIA_H, kr.Position.Z)
-
-    -- Tip of cone (at offset distance in front of killer)
-    local tip = kFlat + fwd * off
-
-    -- Compute arc points at the far end (range distance from killer).
-    -- Negate LookVector so the arc fans out in front of the killer, not behind.
-    local arcPoints = {}
-    for i = 0, DZ_ARC_SEGS do
-        local t = i / DZ_ARC_SEGS  -- 0..1
-        local ang = -halfAng + t * (2 * halfAng)
-        local rotCF = CFrame.new(kFlat) * CFrame.Angles(0, ang, 0)
-        local dir = -rotCF.LookVector
-        arcPoints[i + 1] = kFlat + dir * range
-    end
-
-    -- Edge 1: left side ray (tip → left arc end)
-    -- Edge 2: right side ray (tip → right arc end)
-    -- Edges 3..(2+DZ_ARC_SEGS): arc segments
-    local function placeEdge(edge, p1, p2)
-        local diff = p2 - p1; local len = diff.Magnitude
-        if len > 0.01 and edge and edge.Parent then
-            edge.Size  = Vector3.new(0.3, 0.08, len)
-            edge.CFrame = CFrame.lookAt((p1 + p2) / 2, p1 + diff.Unit)
-        end
-    end
-
-    local inCone = DZ_IsInCone(mr.Position, kr.CFrame, kr.Position)
-    local inC    = DZ_IsInCircle(mr.Position, kr.Position)
-    local nc = DZ_GetColor(); local rc = DZ_GetReadyColor()
-
-    -- Side rays
-    local sideColor = inCone and rc or nc
-    local e1 = z.edges[1]; local e2 = z.edges[2]
-    if e1 then placeEdge(e1, tip, arcPoints[1]);              e1.Transparency = showCone and 0.5 or 1; e1.Color = sideColor end
-    if e2 then placeEdge(e2, tip, arcPoints[DZ_ARC_SEGS+1]); e2.Transparency = showCone and 0.5 or 1; e2.Color = sideColor end
-
-    -- Arc segments
-    for i = 1, DZ_ARC_SEGS do
-        local e = z.edges[2 + i]
-        if e then
-            placeEdge(e, arcPoints[i], arcPoints[i + 1])
-            e.Transparency = showCone and 0.5 or 1
-            e.Color = sideColor
-        end
-    end
-
-    -- Circle (secondary visual, unchanged)
-    if z.circle then
-        local r = State.DZ_CircleRadius or 5
-        z.circle.Size   = Vector3.new(DZ_CIR_H, r * 2, r * 2)
-        z.circle.CFrame = CFrame.new(cCF.Position) * CFrame.Angles(0, 0, math.rad(90))
-        z.circle.Transparency = showCircle and 0.7 or 1
-        z.circle.Color = inC and rc or nc
-    end
-end
-
--- Per-killer sound connections for DZ sound-driven blocking
-local DZ_SoundConns = {}
-
-local function DZ_HookKillerSounds(k)
-    -- Disconnect any existing hooks for this killer first
-    if DZ_SoundConns[k] then
-        for _, c in ipairs(DZ_SoundConns[k]) do pcall(function() c:Disconnect() end) end
-    end
-    DZ_SoundConns[k] = {}
-
-    local kr = k:FindFirstChild("HumanoidRootPart")
-    local lastFire = 0
-
-    local function onSoundPlayed(sound)
-        -- Only fire if either DZ feature is active
-        if not (State.DiamondZoneAB or (G1337 and G1337.settings and G1337.settings.g1337DiamondZone)) then return end
-        if DZ_IsPlayerKiller() then return end
-
-        local id = tostring(sound.SoundId):match("%d+") or ""
-        if not AttackSounds["rbxassetid://" .. id] then return end
-
-        -- Check if the player is inside the diamond zone for this killer
-        if not DZ_IsInZone(k) then return end
-
-        local now = os.clock()
-        if now - lastFire < 0.1 then return end
-        lastFire = now
-
-        local currentKr = k:FindFirstChild("HumanoidRootPart")
-        if State.DiamondZoneAB then
-            pcall(DoBlock, currentKr)
-        end
-        -- Cone gate for G1337 alt block: only fire if no cone equipped, or player is inside the cone zone
-        if G1337 and G1337.settings and G1337.settings.g1337DiamondZone and G1337.remote and G1337.canUseBlock() then
-            if IsConeBlockAllowed(k) then
-                pcall(function() G1337.remote:FireServer("UseActorAbility", {"Block"}) end)
-            end
-        end
-    end
-
-    local function hookSound(sound)
-        if not sound:IsA("Sound") then return end
-        local conn = sound.Played:Connect(function() onSoundPlayed(sound) end)
-        table.insert(DZ_SoundConns[k], conn)
-    end
-
-    for _, d in ipairs(k:GetDescendants()) do hookSound(d) end
-    local dc = k.DescendantAdded:Connect(function(d) hookSound(d) end)
-    table.insert(DZ_SoundConns[k], dc)
-    local ac = k.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            if DZ_SoundConns[k] then
-                for _, c in ipairs(DZ_SoundConns[k]) do pcall(function() c:Disconnect() end) end
-                DZ_SoundConns[k] = nil
-            end
-        end
-    end)
-    table.insert(DZ_SoundConns[k], ac)
-end
-
-local function DZ_UnhookAllSounds()
-    for k, conns in pairs(DZ_SoundConns) do
-        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
-    end
-    table.clear(DZ_SoundConns)
-end
-
-local function DZ_Start()
-    if DZ.running then return end
-    DZ.running = true; DZ.connections = {}; DZ.killerZones = {}
-    DZ.folder = Instance.new("Folder"); DZ.folder.Name = "FlexDiamondZoneVisuals"; DZ.folder.Parent = Workspace
-
-    -- Hook sounds for all current killers
-    if KillersFolder then
-        for _, k in ipairs(KillersFolder:GetChildren()) do
-            if k:IsA("Model") then pcall(DZ_HookKillerSounds, k) end
-        end
-        -- Hook sounds for killers that join later
-        local killerAddedConn = KillersFolder.ChildAdded:Connect(function(k)
-            if k:IsA("Model") and DZ.running then pcall(DZ_HookKillerSounds, k) end
-        end)
-        table.insert(DZ.connections, killerAddedConn)
-    end
-
-    -- Heartbeat only updates visuals now — no block firing here
-    local function step()
-        if not DZ.running or DZ_IsPlayerKiller() then return end
-        local kf = KillersFolder; if not kf then return end
-        local c  = LocalPlayer.Character; local mr = c and c:FindFirstChild("HumanoidRootPart"); if not mr then return end
-        for _, k in ipairs(kf:GetChildren()) do
-            if k:IsA("Model") then
-                local kr = k:FindFirstChild("HumanoidRootPart"); if not kr then continue end
-                local z  = DZ.killerZones[k]
-                if not z or not z.model or not z.model.Parent then
-                    if z and z.model then pcall(function() z.model:Destroy() end) end
-                    z = DZ_BuildZone(k); DZ.killerZones[k] = z
-                    -- Ensure sound hooks exist for newly tracked killers
-                    if not DZ_SoundConns[k] then pcall(DZ_HookKillerSounds, k) end
-                end
-                DZ_UpdateZone(z, kr, mr)
-            end
-        end
-        -- cull killers that left workspace
-        for k, z in pairs(DZ.killerZones) do
-            if not k.Parent or not k:IsDescendantOf(Workspace) then
-                if z.model then pcall(function() z.model:Destroy() end) end
-                DZ.killerZones[k] = nil
-            end
-        end
-    end
-    table.insert(DZ.connections, RunService.Heartbeat:Connect(step))
-end
-
-local function DZ_Stop()
-    if not DZ.running then return end
-    DZ.running = false
-    for _, c in ipairs(DZ.connections) do pcall(function() c:Disconnect() end) end
-    DZ.connections = {}
-    for _, z in pairs(DZ.killerZones) do if z.model then pcall(function() z.model:Destroy() end) end end
-    DZ.killerZones = {}
-    if DZ.folder then pcall(function() DZ.folder:Destroy() end); DZ.folder = nil end
-    DZ_UnhookAllSounds()
-end
-
-function UpdateDiamondZoneVisibility()
-    -- Start the engine whenever either diamond zone feature is enabled, or visuals are requested
-    local need = State.DiamondZoneAB
-        or (G1337 and G1337.settings and G1337.settings.g1337DiamondZone)
-        or State.DZ_ShowDiamond
-        or State.DZ_ShowCircle
-    if need and not DZ.running then DZ_Start()
-    elseif not need and DZ.running then DZ_Stop() end
-end
+function UpdateDiamondZoneVisibility() end -- stub (Cone Zone removed)
 -- ============================================================
 end -- scope
 
@@ -4548,9 +4228,6 @@ end)
 
 -- g1337 auto block
 
--- G1337 Diamond Zone uses the shared DZ engine geometry (DZ_IsInCone defined above).
--- Duplicate helpers removed — both zones now share the same custom range settings.
-
 local G1337 = {}
 G1337.killersFolder = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild("Killers")
 G1337.killersList = {"Sixer", "Slasher", "Noli", "JohnDoe", "c00lkidd", "1x1x1x1", "Nosferatu"}
@@ -4587,7 +4264,6 @@ G1337.settings = {
     sphereRange = 11, sphereEsp = false, customEsp = false,
     boxLength = 15, boxWidth = 6, hdSpeed = 12,
     reactTime = 0.001,
-    g1337DiamondZone = false,  -- Diamond Zone fires block through G1337 remote
 }
 getgenv().PunchAimbot = getgenv().PunchAimbot or { Enabled = true, Mode = "Camera", Smoothness = 0.14, Prediction = 0.133 }
 getgenv().AutoPunch   = getgenv().AutoPunch   or { Enabled = false, Range = 50, ShowRange = false, TrueDash = false }
@@ -4855,7 +4531,7 @@ function G1337.Step()
     G1337.updateESP()
     G1337.UpdatePunchESP()
     if not G1337.killersFolder then return end
-    -- Diamond Zone block is now handled by DZ_HookKillerSounds (sound-event-driven).
+
     -- No continuous polling here — block only fires when a killer M1 attack sound plays
     -- and the player is inside the diamond zone.
     if not (G1337.settings.autoblock or G1337.settings.hd) then return end
@@ -4936,8 +4612,7 @@ local function G1337_hookKillerSounds(killerModel)
                     if root then G1337.show1x1Advice(root) end
                     task.spawn(function()
                         task.wait(0.65 + (G1337.settings.reactTime or 0.001))
-                        -- Cone gate: only block if no cone equipped, or inside the cone zone
-                        if G1337.settings.autoblock and G1337.canUseBlock() and IsConeBlockAllowed(killerModel) then
+                        if G1337.settings.autoblock and G1337.canUseBlock() then
                             G1337.remote:FireServer("UseActorAbility", {"Block"})
                         end
                         local root2 = killerModel:FindFirstChild("HumanoidRootPart")
@@ -4952,8 +4627,7 @@ local function G1337_hookKillerSounds(killerModel)
                 G1337.lastSoundTime[id] = now
                 task.spawn(function()
                     task.wait(G1337.settings.reactTime or 0.001)
-                    -- Cone gate: only block if no cone equipped, or inside the cone zone
-                    if G1337.settings.autoblock and G1337.canUseBlock() and IsConeBlockAllowed(killerModel) then
+                    if G1337.settings.autoblock and G1337.canUseBlock() then
                         G1337.remote:FireServer("UseActorAbility", {"Block"})
                     end
                     local root2 = killerModel:FindFirstChild("HumanoidRootPart")
@@ -5256,6 +4930,122 @@ local function UnloadScript()
     pcall(function() getgenv()._flexsakenESP = nil end)
 end
 
+-- ============================================================
+-- FACING VISION CONE VISUAL
+-- Ported from V1rpBlock by Viper. Draws 3 sphere markers and 4 beam
+-- parts showing the killer's facing cone each heartbeat.
+-- ============================================================
+local VC = {}   -- vision cone state
+VC.enabled    = false
+VC.range      = 13.5
+VC.angle      = 85
+-- Part handles
+VC.tipBall    = nil   -- centre-arc ball
+VC.leftBall   = nil   -- left-edge ball
+VC.rightBall  = nil   -- right-edge ball
+VC.leftRay    = nil   -- beam: origin → left edge
+VC.rightRay   = nil   -- beam: origin → right edge
+VC.leftArc    = nil   -- beam: left edge → tip
+VC.rightArc   = nil   -- beam: tip → right edge
+VC.heartbeat  = nil   -- RBXScriptConnection
+
+local function VC_MakeBall()
+    local p = Instance.new("Part")
+    p.Size = Vector3.new(1, 1, 1); p.Shape = Enum.PartType.Ball
+    p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+    p.Transparency = 0.5; p.Color = Color3.fromRGB(255, 0, 0)
+    p.CFrame = CFrame.new(0, -5000, 0); p.Parent = workspace
+    return p
+end
+
+local function VC_MakeBeam()
+    local p = Instance.new("Part")
+    p.Size = Vector3.new(0.1, 0.1, 1)
+    p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+    p.Transparency = 0.3; p.Color = Color3.fromRGB(255, 0, 0)
+    p.CFrame = CFrame.new(0, -5000, 0); p.Parent = workspace
+    return p
+end
+
+local function VC_PlaceBeam(beam, p1, p2)
+    local diff = p2 - p1; local len = diff.Magnitude
+    if len > 0.01 and beam and beam.Parent then
+        beam.Size = Vector3.new(0.1, 0.1, len)
+        beam.CFrame = CFrame.new((p1 + p2) / 2, p2)
+    end
+end
+
+local function VC_Clear()
+    for _, k in ipairs({"tipBall","leftBall","rightBall","leftRay","rightRay","leftArc","rightArc"}) do
+        if VC[k] then pcall(function() VC[k]:Destroy() end); VC[k] = nil end
+    end
+end
+
+local function VC_GetKillerHRP()
+    local kf = workspace:FindFirstChild("Players") and workspace.Players:FindFirstChild("Killers")
+    if not kf then return nil end
+    for _, k in ipairs(kf:GetChildren()) do
+        local hrp = k:FindFirstChild("HumanoidRootPart")
+        local hum = k:FindFirstChildWhichIsA("Humanoid")
+        if hrp and hum and hum.Health > 0 then return hrp end
+    end
+    return nil
+end
+
+local function VC_Update()
+    if not VC.enabled then
+        if VC.tipBall then VC_Clear() end
+        return
+    end
+
+    local killerHRP = VC_GetKillerHRP()
+    if not killerHRP then VC_Clear(); return end
+
+    local lv       = killerHRP.CFrame.LookVector
+    local halfAng  = math.rad(VC.angle / 2)
+    local perp     = Vector3.new(-lv.Z, 0, lv.X).Unit
+    local leftDir  = (lv * math.cos(halfAng) + perp  * math.sin(halfAng)).Unit
+    local rightDir = (lv * math.cos(halfAng) - perp  * math.sin(halfAng)).Unit
+    local origin   = killerHRP.Position
+    local tipPos   = origin + lv        * VC.range
+    local leftPos  = origin + leftDir   * VC.range
+    local rightPos = origin + rightDir  * VC.range
+
+    -- Lazily create parts
+    if not VC.tipBall   then VC.tipBall   = VC_MakeBall() end
+    if not VC.leftBall  then VC.leftBall  = VC_MakeBall() end
+    if not VC.rightBall then VC.rightBall = VC_MakeBall() end
+    if not VC.leftRay   then VC.leftRay   = VC_MakeBeam() end
+    if not VC.rightRay  then VC.rightRay  = VC_MakeBeam() end
+    if not VC.leftArc   then VC.leftArc   = VC_MakeBeam() end
+    if not VC.rightArc  then VC.rightArc  = VC_MakeBeam() end
+
+    VC.tipBall.Position   = tipPos
+    VC.leftBall.Position  = leftPos
+    VC.rightBall.Position = rightPos
+
+    VC_PlaceBeam(VC.leftRay,   origin,   leftPos)
+    VC_PlaceBeam(VC.rightRay,  origin,   rightPos)
+    VC_PlaceBeam(VC.leftArc,   leftPos,  tipPos)
+    VC_PlaceBeam(VC.rightArc,  tipPos,   rightPos)
+end
+
+local function VC_Start()
+    if VC.heartbeat then return end
+    VC.heartbeat = RunService.Heartbeat:Connect(VC_Update)
+end
+
+local function VC_Stop()
+    if VC.heartbeat then VC.heartbeat:Disconnect(); VC.heartbeat = nil end
+    VC_Clear()
+end
+
+-- Clean up when character respawns
+LocalPlayer.CharacterAdded:Connect(function()
+    if VC.enabled then VC_Clear() end
+end)
+-- ============================================================
+
 local TabAutoBlock = Window:Tab({ Title = "Auto Block", Icon = "shield" })
 local TabVeeronica = Window:Tab({ Title = "Veeronica",  Icon = "star" })
 local TabElliot    = Window:Tab({ Title = "Elliot",     Icon = "zap" })
@@ -5288,23 +5078,17 @@ AddSlider(TabAutoBlock, "HitboxDragRange",   "Drag Range (studs)",   5,  60,  30
 AddSlider(TabAutoBlock, "DragSpeed",         "Drag Speed",           1,  40,  14,  1)
 AddSlider(TabAutoBlock, "BlockDelay",        "Block Delay (ms)",     0,  200, 0,   1)
 
-AddSection(TabAutoBlock, "Cone Zone Auto Block")
-AddToggle(TabAutoBlock, "DiamondZoneAB", "Cone Zone Auto Block", false, function(v)
-    State.DiamondZoneAB = v
-    pcall(UpdateDiamondZoneVisibility)
+AddSection(TabAutoBlock, "Facing Vision Cone")
+AddToggle(TabAutoBlock, "VC_Enabled", "Show Vision Cone", false, function(v)
+    VC.enabled = v
+    if v then VC_Start() else VC_Stop() end
 end)
-AddToggle(TabAutoBlock, "DZ_ShowDiamond", "Show Cone Zone", false, function(v)
-    State.DZ_ShowDiamond = v
-    pcall(UpdateDiamondZoneVisibility)
+AddSlider(TabAutoBlock, "VC_Range", "Vision Range (studs)", 1, 30, 13.5, 0.5, function(v)
+    VC.range = v
 end)
-AddToggle(TabAutoBlock, "DZ_ShowCircle", "Show Circle Zone", false, function(v)
-    State.DZ_ShowCircle = v
-    pcall(UpdateDiamondZoneVisibility)
+AddSlider(TabAutoBlock, "VC_Angle", "Vision Angle (°)", 1, 200, 85, 1, function(v)
+    VC.angle = v
 end)
-AddSlider(TabAutoBlock, "DZ_DiamondLength", "Cone Range",   1,  20,  8,  0.5, function(v) State.DZ_DiamondLength = v end)
-AddSlider(TabAutoBlock, "DZ_DiamondWidth",  "Cone Angle",   10, 180, 45, 1,   function(v) State.DZ_DiamondWidth  = v end)
-AddSlider(TabAutoBlock, "DZ_DiamondOffset", "Cone Offset",  0,  10,  3,  0.5, function(v) State.DZ_DiamondOffset = v end)
-AddSlider(TabAutoBlock, "DZ_CircleRadius",  "Circle Radius",1,  20,  5,  0.5, function(v) State.DZ_CircleRadius  = v end)
 
 AddSection(TabAutoBlock, "Punch (Original)")
 AddToggle(TabAutoBlock, "PunchAimbot", "Punch Aimbot (Two-Time)", false)
@@ -5312,15 +5096,6 @@ AddToggle(TabAutoBlock, "AutoPunch",   "Auto Punch Counter",       false)
 
 AddSection(TabAutoBlock, "Auto Block Alt (G1337)")
 AddToggle(TabAutoBlock, "G1337_AutoBlock", "Autoblock", false, function(v) G1337.settings.autoblock = v end)
-AddSection(TabAutoBlock, "Cone Zone (Alt Block)")
-AddToggle(TabAutoBlock, "G1337_DiamondZoneAB", "Cone Zone Auto Block", false, function(v)
-    G1337.settings.g1337DiamondZone = v
-    -- Do NOT touch State.DiamondZoneAB — the two zones are independent.
-    -- Just start/stop the visual engine based on combined need.
-    pcall(UpdateDiamondZoneVisibility)
-end)
--- Note: visuals and range sliders are shared with the Original Diamond Zone section above.
--- No duplicate sliders here — both zones use the same DZ_DiamondLength/Width/Offset/CircleRadius.
 AddToggle(TabAutoBlock, "G1337_OnlyLooking", "Only When Looking", true, function(v) G1337.settings.onlyLooking = v end)
 AddToggle(TabAutoBlock, "G1337_WallCheck", "Wall Check", true, function(v) G1337.settings.wallCheck = v end)
 AddSlider(TabAutoBlock, "G1337_ReactTime", "React Time (s)", 0.001, 0.5, 0.001, 0.001, function(v) G1337.settings.reactTime = v end)
