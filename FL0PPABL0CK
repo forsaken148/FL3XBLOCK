@@ -873,6 +873,20 @@ end
 
 -- auto block
 
+-- VC (Facing Vision Cone) state is declared here so that VC_IsPlayerInCone,
+-- which lives inside the auto-block do-block below, can reference it.
+-- The visual cone parts and the heartbeat connection are set up later (after
+-- the UI tabs are built) but the table itself must exist first.
+local VC = {}
+VC.enabled = false   -- toggled by "Show Vision Cone" toggle
+VC.range   = 13.5    -- studs – default matches UI slider default
+VC.angle   = 85      -- degrees – default matches UI slider default
+-- Part handles and heartbeat are nil until VC_Start() is called
+VC.tipBall   = nil; VC.leftBall  = nil; VC.rightBall = nil
+VC.leftRay   = nil; VC.rightRay  = nil
+VC.leftArc   = nil; VC.rightArc  = nil
+VC.heartbeat = nil
+
 local VisualCheckBeam, HitboxFolder, SetAutoBlock, UpdateDiamondZoneVisibility -- UpdateDiamondZoneVisibility is a no-op stub
 do
 local AttackSounds = IdSet({
@@ -988,9 +1002,12 @@ local function GetLocalQueryHitbox()
 end
 
 -- Returns true if the local player is inside the killer's facing vision cone.
--- Only called when VC.enabled is true; when the visual is off, blocking is unrestricted.
+-- Gates blocking when EITHER "Show Vision Cone" (VC.enabled) OR
+-- "Strict Visual Check" (State.StrictVisualCheck) is active.
+-- Both share the same VC.range / VC.angle values so the visual cone and the
+-- block gate are always in sync.  When neither is on, blocking is unrestricted.
 local function VC_IsPlayerInCone(Killer)
-    if not VC.enabled then return true end
+    if not VC.enabled and not State.StrictVisualCheck then return true end
     local killerHRP = Killer and Killer:FindFirstChild("HumanoidRootPart")
     if not killerHRP or not LocalRoot then return false end
     local origin   = killerHRP.Position
@@ -1087,19 +1104,24 @@ RunService.Heartbeat:Connect(function()
     _visualTick += 1
     if _visualTick < 5 then return end
     _visualTick = 0
+    -- Beam visual: show when StrictVisualCheck is on (VC visual cone handles its
+    -- own rendering separately via VC_Update / VC_Start).
     if State.StrictVisualCheck and LocalRoot and KillersFolder then
-        local Killer = GetClosestKiller(150)
+        -- Use VC.range so the beam only draws to killers within cone range.
+        local Killer = GetClosestKiller(VC.range)
         if Killer then
             local krp = Killer:FindFirstChild("HumanoidRootPart")
             if krp then
                 if beamAtt0.Parent ~= LocalRoot then beamAtt0.Parent = LocalRoot end
                 if beamAtt1.Parent ~= krp then beamAtt1.Parent = krp end
+                -- Use the same dot-product threshold as VC_IsPlayerInCone
+                local Look  = Vector3.new(krp.CFrame.LookVector.X, 0, krp.CFrame.LookVector.Z)
                 local Offset = LocalRoot.Position - krp.Position
-                local Look   = Vector3.new(krp.CFrame.LookVector.X, 0, krp.CFrame.LookVector.Z)
-                local ToMe   = Vector3.new(Offset.X, 0, Offset.Z)
+                local ToMe  = Vector3.new(Offset.X, 0, Offset.Z)
                 local IsSeeing = false
                 if Look.Magnitude > 0.01 and ToMe.Magnitude > 0.01 then
-                    if Look.Unit:Dot(ToMe.Unit) > 0.6 then IsSeeing = true end
+                    local halfAng = math.rad(VC.angle / 2)
+                    IsSeeing = Look.Unit:Dot(ToMe.Unit) >= math.cos(halfAng)
                 end
                 VisualBeam.Color   = ColorSequence.new(IsSeeing and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(220, 20, 60))
                 VisualBeam.Enabled = true
@@ -4934,20 +4956,10 @@ end
 -- FACING VISION CONE VISUAL
 -- Ported from V1rpBlock by Viper. Draws 3 sphere markers and 4 beam
 -- parts showing the killer's facing cone each heartbeat.
+-- NOTE: VC table is declared earlier (before the auto-block do-block) so that
+-- VC_IsPlayerInCone can reference it.  Only the visual part-creation helpers
+-- and VC_Start / VC_Stop live here.
 -- ============================================================
-local VC = {}   -- vision cone state
-VC.enabled    = false
-VC.range      = 13.5
-VC.angle      = 85
--- Part handles
-VC.tipBall    = nil   -- centre-arc ball
-VC.leftBall   = nil   -- left-edge ball
-VC.rightBall  = nil   -- right-edge ball
-VC.leftRay    = nil   -- beam: origin → left edge
-VC.rightRay   = nil   -- beam: origin → right edge
-VC.leftArc    = nil   -- beam: left edge → tip
-VC.rightArc   = nil   -- beam: tip → right edge
-VC.heartbeat  = nil   -- RBXScriptConnection
 
 local function VC_MakeBall()
     local p = Instance.new("Part")
